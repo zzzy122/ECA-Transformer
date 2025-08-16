@@ -1,0 +1,1325 @@
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+import random
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchaudio
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from speechbrain.pretrained import EncoderClassifier
+from collections import defaultdict
+import warnings
+from torch.cuda.amp import GradScaler, autocast
+import pandas as pd
+from pesq import pesq
+from pystoi import stoi
+import glob
+import torchaudio.functional as F
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
+import pickle
+import os
+import random
+
+
+
+# 设置随机种子确保可复现性
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True  # 启用cuDNN基准测试
+
+# 设备配置 - 使用V100 GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"Device count: {torch.cuda.device_count()}")
+
+# 模型参数配置
+class Config:
+    # 音频参数
+    sample_rate = 16000
+    n_fft = 1024
+    hop_length = 256
+    n_mels = 80
+    duration = 5.0  # 固定5秒音频
+    
+    # 模型参数
+    freq_bins = n_fft // 2 + 1
+    emb_dim = 256  # d-vector维度
+    
+    # 训练参数
+    batch_size = 32  # V100 32GB内存适合的批次大小
+    num_epochs = 200
+    learning_rate = 4e-4
+    weight_decay = 5e-5  # 增加权重衰减
+    patience = 5  # 减少早停耐心值
+    warmup_epochs = 8  # warmup阶段epoch数
+    
+    # 数据加载参数
+    num_workers = 24  # 24核CPU
+    
+    # 数据增强参数
+    noise_dataset_path = "noise_dataset"  # 背景噪声数据集路径
+    rir_dataset_path = "rir_dataset"  # 房间脉冲响应数据集路径
+    
+    # 路径配置
+    output_dir = "model_output_5_1"
+    dataset_split_path = os.path.join(output_dir, "dataset_split.pkl")  # 数据集划分保存路径
+    model_save_path = os.path.join(output_dir, "best_model.pth")
+    log_path = os.path.join(output_dir, "training_log.json")
+    metrics_path = os.path.join(output_dir, "metrics_comparison.csv")
+    
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 训练数据目录
+    train_dir1 = "data_train_1"  # 替换为实际路径
+    train_dir2 = "data_train"    # 替换为实际路径
+
+config = Config()
+
+# 数据增强类
+class AudioAugmenter:
+    def __init__(self, sample_rate=16000):
+        self.sample_rate = sample_rate
+        self.noises = self._load_noises(config.noise_dataset_path)
+        self.rirs = self._load_rirs(config.rir_dataset_path)
+        
+    def _load_noises(self, path):
+        """加载背景噪声数据集"""
+        noises = []
+        if os.path.exists(path):
+            for file in glob.glob(os.path.join(path, "*.wav")) + glob.glob(os.path.join(path, "*.flac")):
+                try:
+                    noise, sr = torchaudio.load(file)
+                    if sr != self.sample_rate:
+                        resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                        noise = resampler(noise)
+                    noises.append(noise)
+                except:
+                    continue
+        print(f"Loaded {len(noises)} background noises")
+        return noises
+    
+    def _load_rirs(self, path):
+        """加载房间脉冲响应"""
+        rirs = []
+        if os.path.exists(path):
+            for file in glob.glob(os.path.join(path, "*.wav")) + glob.glob(os.path.join(path, "*.flac")):
+                try:
+                    rir, sr = torchaudio.load(file)
+                    if sr != self.sample_rate:
+                        resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                        rir = resampler(rir)
+                    rirs.append(rir)
+                except:
+                    continue
+        print(f"Loaded {len(rirs)} room impulse responses")
+        return rirs
+    
+    def add_background_noise(self, clean, snr_db=15):
+        """添加背景噪声"""
+        if not self.noises:
+            return clean
+        
+        noise = random.choice(self.noises)
+        
+        # 裁剪噪声
+        if noise.size(1) < clean.size(0):
+            noise = noise.repeat(1, (clean.size(0) // noise.size(1)) + 1)
+        noise = noise[:, :clean.size(0)]
+        
+        # 计算噪声能量
+        clean_power = torch.sum(clean ** 2)
+        noise_power = torch.sum(noise ** 2)
+        
+        # 设置信噪比
+        snr = 10 ** (snr_db / 10)
+        scale = torch.sqrt(clean_power / (snr * noise_power + 1e-8))
+        noisy = clean + scale * noise.squeeze(0)
+        return noisy / torch.max(torch.abs(noisy))
+    
+    def add_reverb(self, clean):
+        """添加房间混响"""
+        if not self.rirs:
+            return clean
+        
+        rir = random.choice(self.rirs)
+        
+        # 应用卷积
+        reverbed = torch.nn.functional.conv1d(
+            clean.unsqueeze(0).unsqueeze(0), 
+            rir.unsqueeze(0).unsqueeze(0),
+            padding=rir.size(1) - 1
+        ).squeeze()
+        return reverbed / torch.max(torch.abs(reverbed))
+    
+    def time_stretch(self, waveform, factor=0.9):
+        """时间拉伸，保持输出长度不变"""
+        original_length = waveform.size(0)
+        
+        # 计算新长度
+        new_length = int(original_length / factor)
+        
+        # 重采样实现时间拉伸
+        stretched = F.resample(
+            waveform.unsqueeze(0), 
+            orig_freq=self.sample_rate, 
+            new_freq=int(self.sample_rate * factor)
+        )
+        
+        # 裁剪或填充到原始长度
+        stretched = fix_audio_length(stretched.squeeze(0), original_length)
+        
+        return stretched
+    
+    def pitch_shift(self, waveform, semitones=2):
+        """音高变换，保持输出长度不变"""
+        original_length = waveform.size(0)
+        
+        # 音高变换因子 (2^(semitones/12))
+        factor = 2 ** (semitones / 12)
+        
+        # 先时间拉伸
+        stretched = self.time_stretch(waveform, 1/factor)
+        
+        # 然后重采样回原始采样率
+        shifted = F.resample(
+            stretched.unsqueeze(0), 
+            orig_freq=int(self.sample_rate / factor), 
+            new_freq=self.sample_rate
+        )
+        
+        # 确保长度不变
+        shifted = fix_audio_length(shifted.squeeze(0), original_length)
+        
+        return shifted
+    
+# 初始化数据增强器
+augmenter = AudioAugmenter(sample_rate=config.sample_rate)
+
+# 频谱增强类
+class SpecAugment(nn.Module):
+    """频谱增强"""
+    def __init__(self, freq_mask_param=15, time_mask_param=30, num_freq_masks=2, num_time_masks=2):
+        super().__init__()
+        self.freq_mask_param = freq_mask_param
+        self.time_mask_param = time_mask_param
+        self.num_freq_masks = num_freq_masks
+        self.num_time_masks = num_time_masks
+        
+    def forward(self, spec):
+        # spec: [batch, time, freq]
+        # 频率掩蔽
+        for _ in range(self.num_freq_masks):
+            f = torch.randint(0, self.freq_mask_param, (1,)).item()
+            f0 = torch.randint(0, max(1, spec.size(2) - f), (1,)).item()
+            spec[:, :, f0:f0+f] = 0
+        
+        # 时间掩蔽
+        for _ in range(self.num_time_masks):
+            t = torch.randint(0, self.time_mask_param, (1,)).item()
+            t0 = torch.randint(0, max(1, spec.size(1) - t), (1,)).item()
+            spec[:, t0:t0+t, :] = 0
+        
+        return spec
+
+# ==============================================================
+# 修正后的VoiceFilter模型架构 (包含CNN+RNN)
+# ==============================================================
+
+class VoiceFilter(nn.Module):
+    """VoiceFilter 标准模型架构 (包含CNN+RNN)"""
+    def __init__(self, freq_bins, emb_dim=256, hidden_dim=256, num_layers=2, bidirectional=True):
+        super().__init__()
+        self.freq_bins = freq_bins
+        self.emb_dim = emb_dim
+        
+        # CNN特征提取层 (处理频谱-时间特征)
+        self.cnn = nn.Sequential(
+            # 输入形状: [batch, 1, freq_bins, time_steps]
+            nn.Conv2d(1, 64, kernel_size=(3, 3), padding=(1, 1)),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 2)),  # 时间维度下采样
+            
+            nn.Conv2d(64, 128, kernel_size=(3, 3), padding=(1, 1)),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 2)),  # 时间维度下采样
+            
+            nn.Conv2d(128, 256, kernel_size=(3, 3), padding=(1, 1)),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 2)),  # 时间维度下采样
+        )
+        
+        # 计算CNN输出尺寸
+        self.cnn_output_dim = 256 * freq_bins  # 频率维度不变，时间维度下采样8倍
+        
+        # LSTM 层
+        self.lstm = nn.LSTM(
+            input_size=self.cnn_output_dim + emb_dim,  # CNN特征 + 说话人嵌入
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            batch_first=True
+        )
+        
+        # 计算全连接层输入维度
+        fc_input_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        
+        # 全连接层 (输出掩码)
+        self.fc = nn.Sequential(
+            nn.Linear(fc_input_dim, fc_input_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(fc_input_dim // 2, freq_bins),
+            nn.Sigmoid()
+        )
+        
+        # 时间维度上采样 (恢复原始时间分辨率)
+        self.upsample = nn.Upsample(scale_factor=8, mode='linear', align_corners=False)
+        
+        # 打印调试信息
+        print(f"创建 VoiceFilter: freq_bins={freq_bins}, emb_dim={emb_dim}, "
+              f"hidden_dim={hidden_dim}, num_layers={num_layers}, bidirectional={bidirectional}")
+        
+    def forward(self, mix_spec, speaker_emb):
+        """
+        mix_spec: 混合语音幅度谱 [batch, time, freq_bins]
+        speaker_emb: 说话人嵌入 [batch, emb_dim]
+        """
+        # 1. 准备输入形状 [batch, 1, freq_bins, time]
+        x = mix_spec.permute(0, 2, 1)  # [batch, freq_bins, time]
+        x = x.unsqueeze(1)  # [batch, 1, freq_bins, time]
+        
+        # 2. CNN特征提取
+        cnn_features = self.cnn(x)  # [batch, 256, freq_bins, time//8]
+        
+        # 3. 重塑特征 [batch, time//8, 256*freq_bins]
+        batch_size, channels, freq, time = cnn_features.size()
+        cnn_features = cnn_features.permute(0, 3, 1, 2)  # [batch, time//8, channels, freq]
+        cnn_features = cnn_features.reshape(batch_size, time, -1)  # [batch, time//8, channels*freq]
+        
+        # 4. 扩展说话人嵌入以匹配时间步长
+        speaker_emb_expanded = speaker_emb.unsqueeze(1).expand(-1, time, -1)
+        
+        # 5. 拼接CNN特征和说话人嵌入
+        lstm_input = torch.cat([cnn_features, speaker_emb_expanded], dim=2)
+        
+        # 6. 通过LSTM层
+        lstm_out, _ = self.lstm(lstm_input)  # [batch, time//8, hidden_dim*2]
+        
+        # 7. 通过全连接层生成掩码
+        mask = self.fc(lstm_out)  # [batch, time//8, freq_bins]
+        
+        # 8. 上采样恢复原始时间分辨率
+        mask = mask.permute(0, 2, 1)  # [batch, freq_bins, time//8]
+        mask = mask.unsqueeze(1)  # [batch, 1, freq_bins, time//8]
+
+        batch_size, _, freq_bins, time_down = mask.shape
+        mask = mask.reshape(batch_size * freq_bins, 1, time_down)
+
+        mask = self.upsample(mask)  # [batch, 1, freq_bins, time]
+
+        # 恢复原始形状
+        mask = mask.reshape(batch_size, freq_bins, -1)  # [batch, freq_bins, time]
+        mask = mask.permute(0, 2, 1)  # [batch, time, freq_bins]
+        # mask = mask.squeeze(1).permute(0, 2, 1)  # [batch, time, freq_bins]
+        
+        return mask, None
+
+# 完整的语音分离系统
+# ==============================================================
+def fix_audio_length(waveform, target_length):
+    """确保音频长度固定"""
+    current_length = waveform.size(0)
+    
+    if current_length > target_length:
+        # 随机裁剪
+        start = torch.randint(0, current_length - target_length, (1,)).item()
+        return waveform[start:start+target_length]
+    elif current_length < target_length:
+        # 填充
+        padding = target_length - current_length
+        return torch.nn.functional.pad(waveform, (0, padding), mode='constant')
+    else:
+        return waveform
+
+class VoiceFilterSystem(nn.Module):
+    """完整的说话人分离验证系统（使用VoiceFilter预训练模型）"""
+    def __init__(self, sr=16000, n_fft=1024, hop_length=256, n_mels=80):
+        super().__init__()
+        self.sr = sr
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.freq_bins = n_fft // 2 + 1  # 513
+        
+        # 语音特征处理
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sr,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels
+        )
+        
+        # 加载预训练的VoiceFilter d-vector模型
+        print("加载预训练的VoiceFilter d-vector模型...")
+        self.dvector = self._load_voicefilter_model()
+        
+        # 冻结d-vector模型参数
+        print("冻结d-vector模型参数...")
+        self.dvector.eval()
+        for param in self.dvector.parameters():
+            param.requires_grad = False
+            
+        # 分离系统 - 使用标准的VoiceFilter架构
+        self.separation = VoiceFilter(
+            freq_bins=self.freq_bins,
+            emb_dim=256,  # d-vector输出维度是256
+            hidden_dim=512,
+            num_layers=3,
+            bidirectional=True
+        )
+        
+        # SpecAugment
+        self.spec_augment = SpecAugment(
+            freq_mask_param=20,
+            time_mask_param=40,
+            num_freq_masks=2,
+            num_time_masks=2
+        )
+        
+        # 打印模型结构
+        print("分离系统结构:")
+        print(self.separation)
+    
+    def _load_voicefilter_model(self):
+        """加载VoiceFilter预训练的d-vector模型（修正结构以匹配预训练权重）"""
+        class DVector(nn.Module):
+            def __init__(self, num_layers=3, hidden_size=768, embedding_size=256):
+                super().__init__()
+            # 1. 修正LSTM参数：改为单向（匹配预训练模型，无_reverse参数）
+                self.lstm = nn.LSTM(
+                input_size=40,  # MFCC特征维度（保持不变）
+                hidden_size=hidden_size,  # 修正隐藏层大小（768对应预训练的3072/4）
+                num_layers=num_layers,
+                batch_first=True,
+                bidirectional=False  # 预训练模型是单向LSTM，无反向层
+            )
+            
+            # 2. 修正全连接层命名：使用proj.linear_layer匹配预训练权重
+                self.proj = nn.ModuleDict({
+                'linear_layer': nn.Linear(hidden_size, embedding_size)  # 单向LSTM输出维度=hidden_size
+            })
+                self.relu = nn.ReLU()
+            
+            def forward(self, x):
+            # x: [batch, time, 40]
+                self.lstm.flatten_parameters()
+                out, _ = self.lstm(x)
+            # 取最后一个时间步的输出
+                out = out[:, -1, :]
+                out = self.proj['linear_layer'](out)  # 使用预训练模型中的命名
+                out = self.relu(out)
+                return out
+    
+    # 创建模型实例（参数与预训练权重匹配）
+        model = DVector(
+        num_layers=3,  # 层数匹配（错误中提到l0/l1/l2）
+        hidden_size=768,  # 隐藏层大小：3072/4=768（匹配预训练的权重维度）
+        embedding_size=256
+    ).to(device)
+    
+    # 加载预训练权重（保持不变）
+        pretrained_path = "model_output_5_1/voicefilter_model.pt"
+#         if not os.path.exists(pretrained_path):
+#             print(f"请手动下载模型并放置在 {pretrained_path}")
+    
+    # 加载时忽略不匹配的键（如果仍有少量不匹配）
+        state_dict = torch.load(pretrained_path, map_location=device)
+        model.load_state_dict(state_dict, strict=False)  # 允许部分匹配（可选）
+        print("成功加载VoiceFilter预训练权重")
+    
+        return model
+
+
+    def extract_dvector(self, waveform):
+        """提取d-vector嵌入"""
+        # 提取MFCC特征
+        mfcc_transform = torchaudio.transforms.MFCC(
+            sample_rate=self.sr,
+            n_mfcc=40,
+            melkwargs={
+                "n_fft": self.n_fft,
+                "hop_length": self.hop_length,
+                "n_mels": 80
+            }
+        ).to(device)
+        
+        # 计算MFCC
+        mfcc = mfcc_transform(waveform)
+        mfcc = mfcc.permute(0, 2, 1)  # [batch, time, 40]
+        
+        # 通过d-vector模型
+        with torch.no_grad():
+            embeddings = self.dvector(mfcc)
+        
+        return embeddings
+        
+    def forward(self, mixture, reference):
+        """
+        mixture: 混合语音 [batch, samples]
+        reference: 参考语音 [batch, samples]
+        """
+        # 1. 混合语音 STFT 处理
+        window = torch.hann_window(self.n_fft).to(mixture.device)
+        mix_stft = torch.stft(
+            mixture, 
+            n_fft=self.n_fft, 
+            hop_length=self.hop_length,
+            window=window,
+            return_complex=True
+        )
+        mix_mag = torch.abs(mix_stft)  # 幅度谱 [batch, freq, time]
+        
+        # 2. 参考语音通过d-vector模型
+        speaker_emb = self.extract_dvector(reference)
+        
+        # 3. 确保幅度谱形状正确 [batch, time, freq]
+        mix_mag = mix_mag.permute(0, 2, 1)  # 从 [batch, freq, time] 转为 [batch, time, freq]
+        
+        # 4. 训练时应用 SpecAugment
+        if self.training and random.random() < 0.5:
+            mix_mag = self.spec_augment(mix_mag)
+        
+        # 5. 分离系统处理
+        target_mag, _ = self.separation(mix_mag, speaker_emb)
+        
+        # 6. 使用混合语音相位重建时域信号
+        # 恢复相位谱的原始形状 [batch, freq, time]
+        phase = torch.angle(mix_stft)
+        # 目标幅度谱形状是 [batch, time, freq]，需要转为 [batch, freq, time]
+        target_mag = target_mag.permute(0, 2, 1)
+        
+        time_phase = phase.size(2)
+        time_mag = target_mag.size(2)
+        if time_mag != time_phase:
+        # 裁剪到较短的长度（通常是phase更长，裁剪target_mag）
+            target_mag = target_mag[..., :min(time_mag, time_phase)]
+            phase = phase[..., :min(time_mag, time_phase)]
+
+        # 重建复数谱
+        target_stft = target_mag * torch.exp(1j * phase)
+        
+        # 重建时域信号
+        target_audio = torch.istft(
+            target_stft, 
+            n_fft=self.n_fft, 
+            hop_length=self.hop_length,
+            window=window,
+            length=mixture.size(1)
+        )
+        
+        return target_audio, target_mag, None, speaker_emb
+
+class SpeakerSeparationDataset(Dataset):
+    def __init__(self, file_list, sample_rate=16000, duration=4.0, mode='train'):
+        self.file_list = file_list
+        self.sample_rate = sample_rate
+        self.duration = duration
+        self.samples_per_clip = int(sample_rate * duration)
+        self.mode = mode
+        
+        # 提取说话人ID
+        self.speaker_ids = []
+        for file_path in self.file_list:
+            # 从文件路径中提取说话人ID (倒数第二级目录)
+            path_parts = file_path.split(os.sep)
+            if len(path_parts) < 2:
+                speaker_id = "unknown"
+            else:
+                speaker_id = path_parts[-2]  # 倒数第二级目录是说话人ID
+            self.speaker_ids.append(speaker_id)
+        
+        # 创建说话人到文件索引的映射
+        self.speaker_to_indices = defaultdict(list)
+        for idx, speaker_id in enumerate(self.speaker_ids):
+            self.speaker_to_indices[speaker_id].append(idx)
+        
+        print(f"Loaded dataset with {len(file_list)} audio files, {len(self.speaker_to_indices)} speakers")
+    
+    def __len__(self):
+        return len(self.file_list)
+    
+    def __getitem__(self, idx):
+        audio_path = self.file_list[idx]
+        speaker_id = self.speaker_ids[idx]
+        
+        # 加载音频
+        try:
+            waveform, sr = torchaudio.load(audio_path)
+        except:
+            # 如果加载失败，返回随机音频
+            waveform = torch.randn(1, self.samples_per_clip)
+            sr = self.sample_rate
+        
+        # 确保采样率一致
+        if sr != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+            waveform = resampler(waveform)
+        
+        # 确保单声道
+        if waveform.dim() > 1 and waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        
+        # 确保长度一致
+        waveform = waveform.squeeze(0)
+        if waveform.size(0) != self.samples_per_clip:
+            waveform = fix_audio_length(waveform, self.samples_per_clip)
+        
+        return waveform, audio_path, speaker_id
+
+# 语音质量评估函数
+def calculate_audio_metrics(clean, enhanced, sr=16000):
+    """计算语音质量评估指标"""
+    
+    metrics={}
+    
+    clean = clean.squeeze()
+    enhanced = enhanced.squeeze()
+    min_len = min(clean.shape[0], enhanced.shape[0])
+    clean = clean[:min_len]
+    enhanced = enhanced[:min_len]
+
+    # 1. SI-SNR (Scale-Invariant Signal-to-Noise Ratio)
+    def si_snr(estimated, target):
+        # 移除直流分量
+        target = target - torch.mean(target)
+        estimated = estimated - torch.mean(estimated)
+        
+        # 计算最优缩放因子
+        dot = torch.sum(estimated * target)
+        target_energy = torch.sum(target ** 2)
+        scale = dot / (target_energy + 1e-8)
+        
+        # 计算目标信号和噪声
+        target_scaled = scale * target
+        noise = estimated - target_scaled
+        
+        # 计算SI-SNR
+        si_snr_val = 10 * torch.log10(
+            (torch.sum(target_scaled ** 2) + 1e-8) / 
+            (torch.sum(noise ** 2) + 1e-8)
+        )
+        return si_snr_val.item()
+    
+    # 2. SDR (Signal-to-Distortion Ratio)
+    def sdr(estimated, target):
+        target = target - torch.mean(target)
+        estimated = estimated - torch.mean(estimated)
+        noise = estimated - target
+        target_energy = torch.sum(target **2)
+        noise_energy = torch.sum(noise** 2)
+        sdr_val = 10 * torch.log10((target_energy + 1e-8) / (noise_energy + 1e-8))
+        return sdr_val.item()
+    
+    metrics['SI-SNR'] = si_snr(enhanced, clean)
+    metrics['SDR'] = sdr(enhanced, clean)
+    
+    
+    return metrics
+
+
+# 创建混合样本 (带数据增强)
+def create_mixed_sample(dataset, index):
+    """为训练创建混合样本，应用数据增强"""
+    fixed_length = int(config.sample_rate * config.duration)
+    
+    # 获取目标说话人样本
+    target_waveform, target_path, target_speaker = dataset[index]
+    
+    # 随机选择干扰说话人样本 (确保不同说话人)
+    while True:
+        other_idx = random.randint(0, len(dataset) - 1)
+        _, _, other_speaker = dataset[other_idx]
+        if other_speaker != target_speaker:
+            break
+    
+    interference_waveform, _, _ = dataset[other_idx]
+    
+    # 随机混合比例 (SNR在0-5dB之间)
+    snr_db = random.uniform(0, 5)
+    target_energy = torch.sum(target_waveform ** 2)
+    interference_energy = torch.sum(interference_waveform ** 2)
+    
+    # 计算缩放因子
+    snr = 10 ** (snr_db / 10)
+    scale = torch.sqrt(target_energy / (snr * interference_energy + 1e-8))
+    
+    # 创建混合语音
+    mixed_waveform = target_waveform + scale * interference_waveform
+    
+    # 数据增强 (仅在训练模式)
+    if dataset.mode == 'train':
+        if random.random() < 0:  # 70%概率添加背景噪声
+            mixed_waveform = augmenter.add_background_noise(
+                mixed_waveform, 
+                snr_db=random.uniform(10, 25)  # 10-25dB SNR
+            )
+        
+        if random.random() < 0:  # 40%概率添加混响
+            mixed_waveform = augmenter.add_reverb(mixed_waveform)
+        
+        if random.random() < 0:  # 30%概率时间拉伸
+            factor = random.uniform(0.85, 1.15)
+            mixed_waveform = augmenter.time_stretch(mixed_waveform, factor)
+        
+        if random.random() < 0:  # 30%概率音高变换
+            semitones = random.uniform(-3, 3)
+            mixed_waveform = augmenter.pitch_shift(mixed_waveform, semitones)
+    
+    # 归一化混合语音
+    mixed_waveform = mixed_waveform / torch.max(torch.abs(mixed_waveform))
+    
+    # 获取目标说话人的参考语音 (随机选择同一说话人的另一个样本)
+    same_speaker_indices = [i for i in range(len(dataset)) 
+                            if dataset.speaker_ids[i] == target_speaker and i != index]
+    
+    if same_speaker_indices:
+        ref_idx = random.choice(same_speaker_indices)
+        ref_waveform, ref_path, _ = dataset[ref_idx]
+    else:
+        # 如果没有其他样本，使用当前样本作为参考
+        ref_waveform = target_waveform.clone()
+        ref_path = target_path
+    
+    # 确保所有音频都是固定长度
+    target_waveform = fix_audio_length(target_waveform, fixed_length)
+    mixed_waveform = fix_audio_length(mixed_waveform, fixed_length)
+    ref_waveform = fix_audio_length(ref_waveform, fixed_length)
+    
+    return mixed_waveform, ref_waveform, target_waveform, target_path
+
+# 自定义数据加载器
+class MixedDataLoader(DataLoader):
+    """动态生成混合样本的数据加载器"""
+    def __init__(self, dataset, batch_size=32, shuffle=True, num_workers=12):
+        super().__init__(
+            dataset, 
+            batch_size=None,  # 禁用默认批处理
+            shuffle=shuffle,
+            num_workers=num_workers,
+            collate_fn=self.collate_fn,
+            pin_memory=True,  # 加速CPU到GPU的数据传输
+            prefetch_factor=2,  # 每个worker预加载2个batch
+            persistent_workers=True  # 保持worker进程不关闭
+        )
+        self._batch_size = batch_size
+        self.indices = list(range(len(dataset)))
+        
+        if shuffle:
+            random.shuffle(self.indices)
+    
+    def __len__(self):
+        return len(self.dataset) // self._batch_size
+    
+    def collate_fn(self, idx_list):
+        batch_mixed = []
+        batch_ref = []
+        batch_target = []
+        batch_paths = []
+        
+        for idx in idx_list:
+            mixed, ref, target, path = create_mixed_sample(self.dataset, idx)
+            batch_mixed.append(mixed)
+            batch_ref.append(ref)
+            batch_target.append(target)
+            batch_paths.append(path)
+        
+        return (
+            torch.stack(batch_mixed),
+            torch.stack(batch_ref),
+            torch.stack(batch_target),
+            batch_paths
+        )
+    
+    def __iter__(self):
+        batch_indices = []
+        for idx in self.indices:
+            batch_indices.append(idx)
+            if len(batch_indices) == self._batch_size:
+                yield self.collate_fn(batch_indices)
+                batch_indices = []
+        
+        if batch_indices:
+            yield self.collate_fn(batch_indices)
+
+# 损失函数 - SI-SNR/sdr
+def si_snr(estimated, target, eps=1e-8):
+    """计算尺度不变信噪比 (SI-SNR)"""
+    # 归一化
+    target = target - torch.mean(target, dim=-1, keepdim=True)
+    estimated = estimated - torch.mean(estimated, dim=-1, keepdim=True)
+    
+    # 计算目标能量
+    s_target = target
+    s_estimate = estimated
+    
+    # 计算点积
+    dot = torch.sum(s_target * s_estimate, dim=-1, keepdim=True)
+    s_target_energy = torch.sum(s_target ** 2, dim=-1, keepdim=True) + eps
+    
+    # 投影
+    proj = dot * s_target / s_target_energy
+    
+    # 噪声项
+    e_noise = s_estimate - proj
+    
+    # 计算SI-SNR
+    target_energy = torch.sum(proj ** 2, dim=-1)
+    noise_energy = torch.sum(e_noise ** 2, dim=-1)
+    si_snr = 10 * torch.log10((target_energy) / (noise_energy + eps) + eps)
+    return -torch.mean(si_snr)
+
+# def spectral_loss(estimated_mag, target_mag):
+#     """计算幅度谱损失 (L1损失)"""
+#     return torch.mean(torch.abs(estimated_mag - target_mag))
+
+def spectral_loss(estimated_mag, target_mag):
+    """计算幅度谱L1损失，先对齐时间维度"""
+    # 对齐时间维度（第2维）
+    time_est = estimated_mag.size(2)
+    time_tar = target_mag.size(2)
+    if time_est != time_tar:
+        # 裁剪到较短的长度
+        min_time = min(time_est, time_tar)
+        estimated_mag = estimated_mag[..., :min_time]
+        target_mag = target_mag[..., :min_time]
+    return torch.mean(torch.abs(estimated_mag - target_mag))
+
+def phase_loss(enhanced_stft, target_stft):
+    """相位一致性损失"""
+    enhanced_phase = torch.angle(enhanced_stft)
+    target_phase = torch.angle(target_stft)
+    return torch.mean(torch.abs(torch.sin(enhanced_phase - target_phase)))
+
+# 学习率调度器 (Warmup + 余弦退火)
+def create_scheduler(optimizer, num_warmup_epochs, num_training_epochs, initial_lr):
+    """创建warmup + 余弦退火学习率调度器"""
+    # Warmup阶段
+    def warmup_lr_scheduler(epoch):
+        if epoch < num_warmup_epochs:
+            return float(epoch) / float(max(1, num_warmup_epochs))
+        return 1.0
+    
+    # 余弦退火阶段
+    warmup = LambdaLR(optimizer, lr_lambda=warmup_lr_scheduler)
+    cosine_annealing = CosineAnnealingLR(
+        optimizer, 
+        T_max=num_training_epochs - num_warmup_epochs, 
+        eta_min=initial_lr * 0.01  # 最小学习率为初始值的1%
+    )
+    
+    # 组合调度器
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine_annealing],
+        milestones=[num_warmup_epochs]
+    )
+    
+    return scheduler
+
+# 训练函数
+def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, patience, start_epoch=0, best_val_si_snr=-float('inf')):
+    epochs_no_improve = 0
+    history = {'train_loss': [], 'val_loss': [], 'val_si_snr': [], 'lr': []}
+    
+    # 初始化指标比较结果
+    metrics_comparison = []
+    
+    # 混合精度训练的梯度缩放器
+    scaler = GradScaler()
+    
+    for epoch in range(start_epoch, num_epochs):
+        # 更新学习率
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        history['lr'].append(current_lr)
+        print(f"Epoch {epoch+1}/{num_epochs}, LR: {current_lr:.8f}")
+        
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        train_si_snr = 0.0
+        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
+        for mixed, ref, target, _ in progress_bar:
+            mixed = mixed.to(device)
+            ref = ref.to(device)
+            target = target.to(device)
+            
+            # 混合精度训练
+            with autocast():
+                # 前向传播
+                target_audio, target_mag, _, _ = model(mixed, ref)
+                
+                # 计算损失
+                si_snr_loss = si_snr(target_audio, target)
+                
+                # 获取目标幅度谱
+                with torch.no_grad():
+                    target_stft = torch.stft(
+                        target, 
+                        n_fft=config.n_fft, 
+                        hop_length=config.hop_length,
+                        return_complex=True
+                    )
+                    target_mag_gt = torch.abs(target_stft)
+                
+                spec_loss = spectral_loss(target_mag, target_mag_gt)
+                
+                # 混合损失
+                loss = 0.6 * si_snr_loss + 0.4 * spec_loss
+                
+            
+            # 反向传播和优化
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            
+            # 梯度裁剪
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # 更新统计信息
+            train_loss += loss.item()
+            train_si_snr += -si_snr_loss.item()
+            
+            progress_bar.set_postfix({
+                'Loss': f"{loss.item():.4f}",
+                'SI-SNR': f"{-si_snr_loss.item():.2f} dB"
+            })
+        
+        # 计算平均训练损失
+        train_loss /= len(train_loader)
+        train_si_snr /= len(train_loader)
+        history['train_loss'].append(train_loss)
+        
+        # 验证阶段
+        val_loss, val_si_snr, epoch_metrics = validate(model, val_loader)
+        history['val_loss'].append(val_loss)
+        history['val_si_snr'].append(val_si_snr)
+        
+        # 保存指标比较结果
+        epoch_metrics['epoch'] = epoch + 1
+        metrics_comparison.append(epoch_metrics)
+        
+        print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        
+        # 保存最佳模型
+        if val_si_snr > best_val_si_snr:
+            best_val_si_snr = val_si_snr
+            epochs_no_improve = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': val_loss,
+                'si_snr': val_si_snr,
+                'scaler_state_dict': scaler.state_dict(),
+                'best_val_si_snr': best_val_si_snr
+            }, config.model_save_path)
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"Early stopping after {epoch+1} epochs")
+                break
+    
+    return history, metrics_comparison, best_val_si_snr
+
+def validate(model, val_loader, num_samples=50):
+    model.eval()
+    val_loss = 0.0
+    val_si_snr = 0.0
+    count = 0
+    
+    # 初始化指标统计
+    our_model_metrics = {'SI-SNR': 0.0, 'SDR': 0.0}
+    
+    # 用于保存比较结果的样本
+    comparison_samples = []
+    
+    with torch.no_grad():
+        for mixed, ref, target, paths in tqdm(val_loader, desc="Validating"):
+            mixed = mixed.to(device)
+            ref = ref.to(device)
+            target = target.to(device)
+            
+            # 前向传播
+            target_audio, target_mag, _, speaker_emb = model(mixed, ref)
+            
+            # 计算损失
+            si_snr_loss = si_snr(target_audio, target)
+            
+            # 获取目标幅度谱
+            target_stft = torch.stft(
+                target, 
+                n_fft=config.n_fft, 
+                hop_length=config.hop_length,
+                return_complex=True
+            )
+            target_mag_gt = torch.abs(target_stft)
+            
+            spec_loss = spectral_loss(target_mag, target_mag_gt)
+            
+            # 混合损失
+            loss = 0.6 * si_snr_loss + 0.4 * spec_loss 
+            
+            # 更新统计信息
+            val_loss += loss.item()
+            val_si_snr += -si_snr_loss.item()
+            count += 1
+            
+            # 随机选择一些样本进行详细评估
+            if len(comparison_samples) < num_samples:
+                idx = random.randint(0, mixed.size(0)-1)
+                sample = {
+                    'mixed': mixed[idx].cpu(),
+                    'ref': ref[idx].cpu(),
+                    'target': target[idx].cpu(),
+                    'enhanced': target_audio[idx].cpu(),
+                    'speaker_emb': speaker_emb[idx].cpu(),
+                    'path': paths[idx]
+                }
+                comparison_samples.append(sample)
+    
+    val_loss /= count
+    val_si_snr /= count
+    
+    # 计算详细指标
+    for sample in tqdm(comparison_samples, desc="Calculating metrics"):
+        # 我们的模型指标
+        our_metrics = calculate_audio_metrics(sample['target'], sample['enhanced'], config.sample_rate)
+        for k in our_model_metrics:
+            our_model_metrics[k] += our_metrics[k]
+        
+
+    # 创建指标比较字典
+    epoch_metrics = {
+        'our_model_SDR': our_model_metrics['SDR'] / len(comparison_samples)
+    }
+    
+    return val_loss, val_si_snr, epoch_metrics
+
+def load_and_prepare_data():
+    """从两个文件夹加载数据并准备120,000条数据，保存划分结果"""
+    # 如果已有保存的划分，直接加载
+    if os.path.exists(config.dataset_split_path):
+        print("Loading dataset split from file...")
+        with open(config.dataset_split_path, 'rb') as f:
+            split_data = pickle.load(f)
+            return split_data['train'], split_data['val'], split_data['test']
+    
+    # 收集所有音频文件
+    all_audio_files = []
+    
+    # 处理第一个文件夹
+    print(f"Scanning {config.train_dir1} for audio files...")
+    for root, _, files in os.walk(config.train_dir1):
+        for file in files:
+            if file.endswith(".wav") or file.endswith(".flac"):
+                file_path = os.path.join(root, file)
+                # 检查音频长度
+                try:
+                    info = torchaudio.info(file_path)
+                    duration = info.num_frames / info.sample_rate
+                    if duration >= 3.0:  # 只保留长度大于3秒的音频
+                        all_audio_files.append(file_path)
+                except Exception as e:
+                    print(f"Error processing {file_path}: {e}")
+                    continue
+    
+    # 处理第二个文件夹
+    print(f"Scanning {config.train_dir2} for audio files...")
+    for root, _, files in os.walk(config.train_dir2):
+        for file in files:
+            if file.endswith(".wav") or file.endswith(".flac"):
+                file_path = os.path.join(root, file)
+                # 检查音频长度
+                try:
+                    info = torchaudio.info(file_path)
+                    duration = info.num_frames / info.sample_rate
+                    if duration >= 3.0:  # 只保留长度大于3秒的音频
+                        all_audio_files.append(file_path)
+                except Exception as e:
+                    print(f"Error processing {file_path}: {e}")
+                    continue
+    
+    print(f"Found {len(all_audio_files)} audio files with duration >=3 seconds")
+    
+    # 确保有足够的数据
+    if len(all_audio_files) < 120000:
+        raise ValueError(f"Only {len(all_audio_files)} files found, but 120,000 are required.")
+    
+    # 按用户ID分组
+    speaker_data = defaultdict(list)
+    for file_path in all_audio_files:
+        # 提取说话人ID (倒数第二级目录)
+        path_parts = file_path.split(os.sep)
+        if len(path_parts) < 2:
+            speaker_id = "unknown"
+        else:
+            speaker_id = path_parts[-2]  # 倒数第二级目录是说话人ID
+        speaker_data[speaker_id].append(file_path)
+    
+    print(f"Found {len(speaker_data)} unique speakers")
+    
+    # 按用户ID划分数据集 (10:1:1)
+    speaker_ids = list(speaker_data.keys())
+    random.shuffle(speaker_ids)
+    
+    # 计算所需文件数
+    total_files_needed = 120000
+    train_files_needed = 100000
+    val_files_needed = 10000
+    test_files_needed = 10000
+    
+    # 分配用户到不同数据集
+    train_files = []
+    val_files = []
+    test_files = []
+    
+    # 先分配训练集用户
+    for sid in speaker_ids:
+        # 如果训练集还未满，添加该用户的所有音频
+        if len(train_files) < train_files_needed:
+            # 计算当前用户可添加的最大文件数（不超过训练集剩余容量）
+            max_to_add = min(len(speaker_data[sid]), train_files_needed - len(train_files))
+            if max_to_add > 0:
+                selected_files = random.sample(speaker_data[sid], max_to_add)
+                train_files.extend(selected_files)
+        
+        # 然后分配验证集
+        elif len(val_files) < val_files_needed:
+            max_to_add = min(len(speaker_data[sid]), val_files_needed - len(val_files))
+            if max_to_add > 0:
+                selected_files = random.sample(speaker_data[sid], max_to_add)
+                val_files.extend(selected_files)
+        
+        # 最后分配测试集
+        elif len(test_files) < test_files_needed:
+            max_to_add = min(len(speaker_data[sid]), test_files_needed - len(test_files))
+            if max_to_add > 0:
+                selected_files = random.sample(speaker_data[sid], max_to_add)
+                test_files.extend(selected_files)
+        
+        # 如果所有数据集都已满足，停止分配
+        if (len(train_files) >= train_files_needed and 
+            len(val_files) >= val_files_needed and 
+            len(test_files) >= test_files_needed):
+            break
+    
+    # 确保精确数量
+    train_files = train_files[:train_files_needed]
+    val_files = val_files[:val_files_needed]
+    test_files = test_files[:test_files_needed]
+    
+    print(f"After initial assignment: Train {len(train_files)}, Val {len(val_files)}, Test {len(test_files)}")
+    
+    # 检查用户ID是否跨数据集
+    def get_speaker_ids(files):
+        speaker_ids = set()
+        for file_path in files:
+            path_parts = file_path.split(os.sep)
+            if len(path_parts) < 2:
+                speaker_id = "unknown"
+            else:
+                speaker_id = path_parts[-2]  # 倒数第二级目录是说话人ID
+            speaker_ids.add(speaker_id)
+        return speaker_ids
+    
+    train_speakers = get_speaker_ids(train_files)
+    val_speakers = get_speaker_ids(val_files)
+    test_speakers = get_speaker_ids(test_files)
+    
+    # 验证没有重叠的说话人
+    assert len(train_speakers & val_speakers) == 0, "训练集和验证集有重叠用户"
+    assert len(train_speakers & test_speakers) == 0, "训练集和测试集有重叠用户"
+    assert len(val_speakers & test_speakers) == 0, "验证集和测试集有重叠用户"
+    
+    print(f"Final dataset split: Train {len(train_files)} files ({len(train_speakers)} speakers), "
+          f"Val {len(val_files)} files ({len(val_speakers)} speakers), "
+          f"Test {len(test_files)} files ({len(test_speakers)} speakers)")
+    
+    # 保存数据集划分
+    split_data = {
+        'train': train_files,
+        'val': val_files,
+        'test': test_files
+    }
+    
+    with open(config.dataset_split_path, 'wb') as f:
+        pickle.dump(split_data, f)
+    
+    print(f"Dataset split saved to {config.dataset_split_path}")
+    
+    return train_files, val_files, test_files
+
+# 主函数
+def main():
+    # 加载数据
+    torch.set_grad_enabled(True)
+    
+    print("Loading and preparing data...")
+    train_files, val_files, test_files = load_and_prepare_data()
+    
+    # 创建数据集对象
+    train_dataset = SpeakerSeparationDataset(
+        train_files, 
+        sample_rate=config.sample_rate,
+        duration=config.duration,
+        mode='train'
+    )
+    
+    val_dataset = SpeakerSeparationDataset(
+        val_files, 
+        sample_rate=config.sample_rate,
+        duration=config.duration,
+        mode='val'
+    )
+    
+    test_dataset = SpeakerSeparationDataset(
+        test_files, 
+        sample_rate=config.sample_rate,
+        duration=config.duration,
+        mode='test'
+    )
+    
+    print(f"Train dataset: {len(train_dataset)} samples")
+    print(f"Val dataset: {len(val_dataset)} samples")
+    print(f"Test dataset: {len(test_dataset)} samples")
+    
+    # 创建数据加载器
+    train_loader = MixedDataLoader(
+        train_dataset, 
+        batch_size=config.batch_size, 
+        shuffle=True,
+        num_workers=config.num_workers
+    )
+    
+    val_loader = MixedDataLoader(
+        val_dataset, 
+        batch_size=config.batch_size, 
+        shuffle=False,
+        num_workers=config.num_workers
+    )
+    
+    test_loader = MixedDataLoader(
+        test_dataset, 
+        batch_size=config.batch_size, 
+        shuffle=False,
+        num_workers=config.num_workers
+    )
+    
+    # 初始化模型
+    print("Initializing model...")
+    model = VoiceFilterSystem(  # 修改这里，使用新的VoiceFilterSystem
+        sr=config.sample_rate,
+        n_fft=config.n_fft,
+        hop_length=config.hop_length,
+        n_mels=config.n_mels
+    ).to(device)
+#     model = ECAPA_TSVS(
+#         sr=config.sample_rate,
+#         n_fft=config.n_fft,
+#         hop_length=config.hop_length,
+#         n_mels=config.n_mels
+#     ).to(device)
+    
+    # 打印模型参数数量
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {total_params:,}")
+    
+    # 优化器
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=config.learning_rate, 
+        weight_decay=config.weight_decay,
+        betas=(0.9, 0.98) 
+    )
+    
+    # 学习率调度器 (Warmup + 余弦退火)
+    scheduler = create_scheduler(
+        optimizer, 
+        num_warmup_epochs=config.warmup_epochs,
+        num_training_epochs=config.num_epochs,
+        initial_lr=config.learning_rate
+    )
+    
+    # 检查是否存在检查点
+    start_epoch = 0
+    best_val_si_snr = -float('inf')
+    if os.path.exists(config.model_save_path):
+        print("Loading checkpoint for resuming training...")
+        checkpoint = torch.load(config.model_save_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_si_snr = checkpoint['best_val_si_snr']
+        print(f"Resuming from epoch {start_epoch}, best_val_si_snr: {best_val_si_snr:.2f} dB")
+    
+    # 训练模型
+    print("Starting training...")
+    history, metrics_comparison, best_val_si_snr = train(
+        model, 
+        train_loader, 
+        val_loader, 
+        optimizer, 
+        scheduler,
+        num_epochs=config.num_epochs,
+        patience=config.patience,
+        start_epoch=start_epoch,
+        best_val_si_snr=best_val_si_snr
+    )
+    
+    # 测试模型
+    print("Testing model...")
+    test_loss, test_si_snr, test_metrics = validate(
+        model, 
+        test_loader
+    )
+    
+    print(f"Test Loss: {test_loss:.4f}, Test SI-SNR: {test_si_snr:.2f} dB")
+    
+    # 保存最终模型
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict()
+    }, os.path.join(config.output_dir, "final_model.pth"))
+    
+    # 保存测试结果
+    test_metrics['epoch'] = 'Test'
+    metrics_comparison.append(test_metrics)
+    pd.DataFrame(metrics_comparison).to_csv(config.metrics_path, index=False)
+    
+    print("Training completed!")
+
+if __name__ == "__main__":
+    main()
+    
+
