@@ -14,11 +14,10 @@ Main scripts:
 ### Highlights
 - ECAPA speaker conditioning: freeze `speechbrain/spkrec-ecapa-voxceleb` for fast and stable inference;
 - Transformer encoding: `nn.TransformerEncoder` for `[time, feature]` sequences;
-- Speaker-aware decoder: align temporal features with the d-vector to focus on the target speaker explicitly;
 - Multi-decoder + residual gated fusion: more expressive and robust mask estimation;
 - SpecAugment and waveform-level augmentation: frequency/time masking, background noise, reverberation, time-stretch, and pitch-shift (during training);
 - Training tricks: AMP mixed precision, gradient clipping, warmup + cosine annealing, early stopping;
-- Metrics: SI-SNR, SDR (optionally PESQ/STOI).
+- Metrics: SI-SNR, SDR.
 
 
 ## Model Overview
@@ -216,6 +215,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
