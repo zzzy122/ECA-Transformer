@@ -184,24 +184,6 @@ torchaudio.save('enhanced.wav', enhanced.cpu().unsqueeze(0), Config.sample_rate)
 
 - Training loss: `L = 0.6 * SI-SNR + 0.4 * spectral/phase-consistency loss` (implemented and switchable);
 - Evaluation: `SI-SNR`, `SDR` (default);
-- Optional: `PESQ`, `STOI` (install the deps and enable in validation).
-
-
-## Ablations
-
-Provided for reproducibility and comparison:
-
-- VoiceFilter baseline (`speaker_separation_with_progress_vf.py`):
-  - CNN + BiLSTM decoder;
-  - d-vector (256-D) from a corrected VoiceFilter d-vector model (place weights at `model_output_5_1/voicefilter_model.pt`).
-
-- Number of decoders: change `SpeakerSeparationSystem(num_decoders=...)` to compare single vs multi-decoder gated fusion;
-- Remove attention: in `SpeakerConditionedDecoder`, concatenate `x` and `speaker_emb` only (drop `attn_query/attn_key` and softmax);
-- Replace speaker embedding: ECAPA d-vector → VoiceFilter d-vector;
-- Disable augmentation/SpecAugment;
-- Different loss weights: tune SI-SNR vs spectral/phase terms.
-
-Compare the trends via logs and `metrics_comparison.csv`.
 
 
 ## Configuration
@@ -237,11 +219,6 @@ ECA-Transformer/
 - We also reference the VoiceFilter d-vector concept and open-source implementations.
 
 
-## License & Citation
-
-- License: please add a `LICENSE` at repo root (MIT or Apache-2.0 recommended).
-- If you use this project in academic work, please cite SpeechBrain and relevant literature on target speaker extraction/separation.
-
 ### References
 
 - A. Vaswani et al., "Attention Is All You Need," NeurIPS 2017.
@@ -251,5 +228,6 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
