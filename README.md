@@ -126,19 +126,10 @@ Artifacts:
   model.eval()
   ```
 
-- Optional: convert a full checkpoint to "weights only" for publishing/deployment:
-  ```python
-  import torch
-  src = torch.load('model_output_3_2/best_model.pth', map_location='cpu')
-  torch.save(src['model_state_dict'], 'model_output_3_2/best_model.weights_only.pth')
-  ```
-
-
 ### 2) Evaluation / Test
 
 Each epoch is validated, and the final test split is evaluated:
 - Metrics: `SI-SNR` and `SDR` (averaged);
-- `PESQ/STOI` can be added in `validate()` (dependencies already referenced).
 
 
 ### 3) Single-sample Inference Example
@@ -191,7 +182,6 @@ torchaudio.save('enhanced.wav', enhanced.cpu().unsqueeze(0), Config.sample_rate)
 - Audio: `sample_rate=16000, n_fft=1024, hop_length=256, n_mels=80, duration=5.0`
 - Training: `batch_size`, `num_epochs`, `learning_rate=4e-4`, `weight_decay=5e-5`, `warmup_epochs=8`, `patience=5`
 - Paths: `output_dir`, `dataset_split_path`, `model_save_path`, `metrics_path`
-- Augmentation roots (optional): `noise_dataset_path`, `rir_dataset_path`
 
 
 ## Practical Tips
@@ -200,8 +190,6 @@ torchaudio.save('enhanced.wav', enhanced.cpu().unsqueeze(0), Config.sample_rate)
 - Reproducibility: fixed `SEED=42` in code;
 - Monitoring: watch validation `SI-SNR` and rely on early stopping;
 - Artifacts: check `best_model.pth` and `metrics_comparison.csv` under `output_dir`;
-- Windows/PESQ: if installation is troublesome, skip PESQ/STOI and focus on `SI-SNR/SDR` first.
-
 
 ## Project Structure
 
@@ -228,6 +216,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
