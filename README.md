@@ -22,6 +22,8 @@ Main scripts:
 
 ## Model Overview
 
+![ECA-Transformer Architecture](eca_transformer_arch.png)
+
 ECA-Transformer has three major parts:
 
 1) Speaker embedding (frozen): ECAPA-TDNN extracts a d-vector (typically 192-D) from the reference audio as the conditioning vector.
@@ -216,6 +218,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
