@@ -109,7 +109,8 @@ Artifacts:
 
 - Contents:
   - ECA-Transformer: `best_model.pth`, `final_model.pth`
-  - VoiceFilter d-vector: `model_output_5_1/voicefilter_model.pt`
+  - best_model_voicefilter.pth
+  - best_model_ablation.pth
 
 - Where to place:
   - Put ECA-Transformer checkpoints under the `Config.output_dir` of `speaker_separation_with_progress_transformer.py` (default `model_output_3_2`).
@@ -215,6 +216,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
