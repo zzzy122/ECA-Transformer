@@ -8,7 +8,7 @@ ECA-Transformer is an end-to-end training framework for Target Speaker Extractio
 
 Main scripts:
 - `speaker_separation_with_progress_transformer.py` (ECA-Transformer main)
-- `speaker_separation_with_progress_vf.py` (VoiceFilter baseline and ablations for comparison)
+- `speaker_separation_with_progress_vf.py` (VoiceFilter baseline)
 - `speaker_separation_with_progress_ablation.py` (VoiceFilter baseline with ECAPA-TDNN embeddings, used for ablations and comparison)
 
 ### Highlights
@@ -66,12 +66,12 @@ root_dataset/
 Duration: by default each clip is cropped or padded to `5s` (`Config.duration`). Audio will be resampled to `16kHz`.
 
 - Build a split quickly (creates `dataset_split.pkl`):
-  - In `speaker_separation_with_progress_vf.py`, set:
+  - In `speaker_separation_with_progress_transformer.py`, set:
     - `Config.train_dir1`, `Config.train_dir2` to your data roots (can be the same or different);
-    - `Config.output_dir` (default `model_output_5_1`).
+    - `Config.output_dir` (default `model_output_3_2`).
   - Run:
     ```bash
-    python speaker_separation_with_progress_vf.py
+    speaker_separation_with_progress_transformer.py
     ```
   - On first run it scans data and saves `output_dir/dataset_split.pkl` (approx. 10:1:1 train/val/test). Training scripts will reuse it afterward.
 
@@ -197,8 +197,8 @@ torchaudio.save('enhanced.wav', enhanced.cpu().unsqueeze(0), Config.sample_rate)
 ```
 ECA-Transformer/
   ├─ speaker_separation_with_progress_transformer.py   # ECA-Transformer main script
-  ├─ speaker_separation_with_progress_vf.py            # VoiceFilter baseline / ablations
-  └─ speaker_separation_with_progress_ablation.py      # other supplementary experiments
+  ├─ speaker_separation_with_progress_vf.py            # VoiceFilter baseline 
+  └─ speaker_separation_with_progress_ablation.py      # VoiceFilter baseline with ECAPA-TDNN embeddings for ablations experiments
 ```
 
 
@@ -217,6 +217,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
