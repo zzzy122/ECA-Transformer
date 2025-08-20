@@ -115,7 +115,7 @@ Artifacts:
 
 - Where to place:
   - Put ECA-Transformer checkpoints under the `Config.output_dir` of `speaker_separation_with_progress_transformer.py` (default `model_output_3_2`).
-  - Put the VoiceFilter d-vector weights at `model_output_5_1/voicefilter_model.pt` (or adjust the path in `speaker_separation_with_progress_vf.py`).
+  - Put the VoiceFilter d-vector weights at `model_output_5_1` (or adjust the path in `speaker_separation_with_progress_vf.py`).
 
 - About size: checkpoints are full training states containing the following keys, which makes them large (total >10GB is normal):
   - `epoch`, `model_state_dict` (weights), `optimizer_state_dict`, `scheduler_state_dict`, `loss`, `si_snr`, `scaler_state_dict` (AMP scaler), `best_val_si_snr`.
@@ -217,6 +217,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
