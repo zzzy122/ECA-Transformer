@@ -9,7 +9,7 @@ ECA-Transformer is an end-to-end training framework for Target Speaker Extractio
 Main scripts:
 - `speaker_separation_with_progress_transformer.py` (ECA-Transformer main)
 - `speaker_separation_with_progress_vf.py` (VoiceFilter baseline and ablations for comparison)
-
+- `speaker_separation_with_progress_ablation.py` (VoiceFilter baseline with ECAPA-TDNN embeddings, used for ablations and comparison)
 
 ### Highlights
 - ECAPA speaker conditioning: freeze `speechbrain/spkrec-ecapa-voxceleb` for fast and stable inference;
@@ -218,6 +218,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
