@@ -100,7 +100,6 @@ Defaults during training:
 
 Artifacts:
 - Best checkpoint: `<output_dir>/best_model.pth`
-- Final checkpoint: `<output_dir>/final_model.pth`
 - Metrics CSV: `<output_dir>/metrics_comparison.csv`
 
 ### Pretrained Weights & Checkpoints
@@ -218,6 +217,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
