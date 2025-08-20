@@ -174,7 +174,7 @@ torchaudio.save('enhanced.wav', enhanced.cpu().unsqueeze(0), Config.sample_rate)
 
 ## Loss & Metrics
 
-- Training loss: `L = 0.6 * SI-SNR + 0.4 * spectral/phase-consistency loss` (implemented and switchable);
+- Training loss: `L = 0.6 * SI-SNR + 0.4 * phase-consistency loss`;
 - Evaluation: `SI-SNR`, `SDR` (default);
 
 
@@ -187,7 +187,7 @@ torchaudio.save('enhanced.wav', enhanced.cpu().unsqueeze(0), Config.sample_rate)
 
 ## Practical Tips
 
-- Hardware: with 24GB+ VRAM you can use larger `batch_size` (e.g., 64–128); reduce it if you run out of memory;
+- Hardware: with 32GB+ VRAM ,batch_size 128; reduce it if you run out of memory;
 - Reproducibility: fixed `SEED=42` in code;
 - Monitoring: watch validation `SI-SNR` and rely on early stopping;
 - Artifacts: check `best_model.pth` and `metrics_comparison.csv` under `output_dir`;
@@ -217,6 +217,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
