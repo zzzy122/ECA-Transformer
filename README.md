@@ -109,7 +109,7 @@ Artifacts:
   - File name in the share: `ECA-Transformer model.zip` (shared by Baidu Netdisk Super Member v6)
 
 - Contents:
-  - ECA-Transformer: `best_model.pth`, `final_model.pth`
+  - ECA-Transformer: `best_model.pth`
   - best_model_voicefilter.pth
   - best_model_ablation.pth
 
@@ -217,6 +217,7 @@ ECA-Transformer/
 - Y. Luo and N. Mesgarani, "Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation," IEEE/ACM TASLP 2019.
 - A. W. Rix et al., "Perceptual evaluation of speech quality (PESQ)," IEEE ICASSP 2001.
 - C. H. Taal et al., "A Short-Time Objective Intelligibility Measure for Time-Frequency Weighted Noisy Speech," IEEE TASL 2011.
+
 
 
 
